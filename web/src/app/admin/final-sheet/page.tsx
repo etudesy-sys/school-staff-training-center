@@ -1,0 +1,413 @@
+"use client";
+
+import { AdminAuthGate, AdminLogoutButton } from "@/components/admin-auth-gate";
+import { generateFinalAttendanceSheet, getFinalAttendancePreview, getTrainingList, loadAppConfig } from "@/lib/apps-script";
+import type { AppConfig, FinalAttendancePreviewResult, FinalAttendanceRow, Training } from "@/lib/types";
+import { getBasePath } from "@/lib/paths";
+import { useEffect, useMemo, useState } from "react";
+
+const APP_BASE_PATH = getBasePath();
+
+function CheckIcon() {
+  return (
+    <svg aria-hidden="true" className="icon" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.85" viewBox="0 0 24 24">
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+function trainingMeta(training?: Training) {
+  if (!training) {
+    return "";
+  }
+
+  return [training.date, training.time, training.place ?? training.location, training.department].filter(Boolean).join(" · ");
+}
+
+function quoteCsv(value: string | number | undefined) {
+  const text = String(value ?? "");
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function buildCsv(rows: FinalAttendanceRow[]) {
+  const header = ["순번", "교육ID", "교육명", "교육일자", "교육시간", "장소", "성명", "소속부서", "직책", "출석일시", "서명여부", "서명파일URL", "이수증제출여부", "이수상태", "비고"];
+  const body = rows.map((row) => [
+    row.sequence,
+    row.trainingId,
+    row.trainingTitle,
+    row.trainingDate,
+    row.trainingTime ?? "",
+    row.place ?? "",
+    row.name,
+    row.department,
+    row.position,
+    row.signedAt ?? row.attendedAt,
+    row.signatureStatus,
+    row.signatureFileUrl,
+    row.certificateStatus ?? (row.certificateSubmitted ? "제출" : "미제출"),
+    row.completionStatus,
+    row.note ?? ""
+  ]);
+
+  return [header, ...body].map((line) => line.map(quoteCsv).join(",")).join("\n");
+}
+
+function sanitizeFilename(value: string) {
+  return value.replace(/[\\/:*?"<>|\s]+/g, "").slice(0, 28) || "교육";
+}
+
+function downloadCsv(filename: string, rows: FinalAttendanceRow[]) {
+  const csv = `\uFEFF${buildCsv(rows)}`;
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function statusClassName(status: FinalAttendanceRow["completionStatus"]) {
+  if (status === "이수완료") {
+    return "status-chip status-completed";
+  }
+
+  if (status === "서명필요") {
+    return "status-chip status-review";
+  }
+
+  return "status-chip status-incomplete";
+}
+
+export default function AdminFinalSheetPage() {
+  const [runtimeConfig, setRuntimeConfig] = useState<AppConfig>();
+  const [trainings, setTrainings] = useState<Training[]>([]);
+  const [selectedTrainingId, setSelectedTrainingId] = useState("");
+  const [preview, setPreview] = useState<FinalAttendancePreviewResult>();
+  const [message, setMessage] = useState("교육목록을 불러오는 중입니다.");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatedFile, setGeneratedFile] = useState<{ fileId?: string; fileUrl?: string }>();
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadPage() {
+      const configResult = await loadAppConfig();
+
+      if (ignore) {
+        return;
+      }
+
+      if (!configResult.ok) {
+        setMessage(configResult.message);
+        return;
+      }
+
+      setRuntimeConfig(configResult.config);
+      const trainingResult = await getTrainingList(configResult.config);
+
+      if (ignore) {
+        return;
+      }
+
+      if (trainingResult.error) {
+        setMessage(trainingResult.error);
+        return;
+      }
+
+      const activeTrainings = trainingResult.data.filter((training) =>
+        ["활성", "진행중", "준비중", "active", "ready", "y", "yes", "사용"].includes((training.status ?? training.activeStatus ?? "").trim().toLowerCase())
+      );
+      setTrainings(activeTrainings);
+      setSelectedTrainingId(activeTrainings[0]?.trainingId ?? "");
+      setMessage(activeTrainings.length ? "최종 서명부를 생성할 교육을 선택해 주세요." : "활성 교육이 없습니다.");
+    }
+
+    void loadPage();
+
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadPreview() {
+      if (!runtimeConfig || !selectedTrainingId) {
+        setPreview(undefined);
+        setGeneratedFile(undefined);
+        return;
+      }
+
+      setMessage("최종 서명부 미리보기를 생성하는 중입니다.");
+      const result = await getFinalAttendancePreview(runtimeConfig, selectedTrainingId);
+
+      if (ignore) {
+        return;
+      }
+
+      if (result.error || !result.data) {
+        setPreview(undefined);
+        setMessage(result.error || "최종 서명부 미리보기를 불러오지 못했습니다.");
+        return;
+      }
+
+      setPreview(result.data);
+      setGeneratedFile({
+        fileId: result.data.training.finalRosterFileId,
+        fileUrl: result.data.training.finalRosterFileUrl
+      });
+      setMessage("최종 서명부 미리보기를 불러왔습니다.");
+    }
+
+    void loadPreview();
+
+    return () => {
+      ignore = true;
+    };
+  }, [runtimeConfig, selectedTrainingId]);
+
+  const selectedTraining = trainings.find((training) => training.trainingId === selectedTrainingId);
+  const filename = useMemo(() => {
+    const title = sanitizeFilename(selectedTraining?.title ?? preview?.training.title ?? "");
+    return `최종서명부_${selectedTrainingId}_${title}.csv`;
+  }, [preview?.training.title, selectedTraining?.title, selectedTrainingId]);
+  const completionRate = preview?.summary.targetCount ? Math.round((preview.summary.completed / preview.summary.targetCount) * 100) : 0;
+  const unsignedCount = preview?.summary.unsigned ?? preview?.summary.signatureRequired ?? 0;
+
+  async function handleDownload() {
+    if (!runtimeConfig || !selectedTrainingId || !preview?.rows.length) {
+      setMessage("다운로드할 최종 서명부 데이터가 없습니다.");
+      return;
+    }
+
+    setIsGenerating(true);
+    setMessage("최종 서명부를 기록하고 CSV를 준비하는 중입니다.");
+
+    const result = await generateFinalAttendanceSheet(runtimeConfig, selectedTrainingId);
+
+    if (result.error || !result.data) {
+      setMessage(result.error || "최종 서명부 생성에 실패했습니다.");
+      setIsGenerating(false);
+      return;
+    }
+
+    downloadCsv(filename, result.data.rows);
+    setPreview({
+      training: result.data.training,
+      summary: result.data.summary,
+      rows: result.data.rows
+    });
+    setGeneratedFile({
+      fileId: result.data.fileId || result.data.training.finalRosterFileId,
+      fileUrl: result.data.fileUrl || result.data.training.finalRosterFileUrl
+    });
+    setMessage(`08_최종서명부에 ${result.data.writtenCount}건을 기록하고 CSV를 다운로드했습니다.${result.data.fileUrl ? " 생성 파일 URL도 교육목록에 저장했습니다." : ""}`);
+    setIsGenerating(false);
+  }
+
+  return (
+    <AdminAuthGate>
+      <main className="page">
+      <div className="dashboard-shell">
+        <div className="route-actions">
+          <span className="page-toolbar-title">최종 서명부</span>
+          <a className="ghost-button" href={`${APP_BASE_PATH}/`}>
+            홈으로
+          </a>
+          <a className="ghost-button" href={`${APP_BASE_PATH}/admin`}>
+            관리자 메뉴
+          </a>
+          <AdminLogoutButton />
+        </div>
+
+        <section className="today-card" aria-label="최종 서명부">
+          <div className="today-copy">
+            <div className="section-kicker">
+              <CheckIcon />
+              <span>최종 서명부</span>
+            </div>
+            <h1>감사·증빙용 최종 서명부를 생성합니다.</h1>
+            <p>교육별 대상자 명단에 전자서명 기록을 붙여 최종 서명부를 생성합니다.</p>
+          </div>
+        </section>
+
+        {message ? (
+          <div className="soft-alert" role="status">
+            {message}
+          </div>
+        ) : null}
+
+        <div className="admin-attendance-layout">
+          <section className="training-section" aria-label="교육 선택">
+            <div className="section-head">
+              <div>
+                <h2>교육 선택</h2>
+                <p>최종 서명부를 생성할 활성 교육을 선택하세요.</p>
+              </div>
+            </div>
+
+            {trainings.length ? (
+              <div className="status-list">
+                <label className="field-group">
+                  <span>교육 선택</span>
+                  <select onChange={(event) => setSelectedTrainingId(event.target.value)} value={selectedTrainingId}>
+                    {trainings.map((training) => (
+                      <option key={training.trainingId} value={training.trainingId}>
+                        {training.title || training.trainingId}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {trainings.map((training) => (
+                  <button
+                    className={`training-card qr-training-option${training.trainingId === selectedTrainingId ? " selected" : ""}`}
+                    key={training.trainingId}
+                    onClick={() => setSelectedTrainingId(training.trainingId)}
+                    type="button"
+                  >
+                    <strong>{training.title}</strong>
+                    <p>{trainingMeta(training)}</p>
+                    <div className="badge-row">
+                      <span>{training.trainingId}</span>
+                      <span>전자서명 기준</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-training">
+                <div>
+                  <strong>활성 교육이 없습니다.</strong>
+                  <p>교육목록에서 활성 교육을 먼저 등록해 주세요.</p>
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="training-section" aria-label="최종 서명부 미리보기">
+            <div className="section-head">
+              <div>
+                <h2>{selectedTraining?.title ?? "최종 서명부 미리보기"}</h2>
+                <p>{selectedTraining ? trainingMeta(selectedTraining) : "교육을 선택하면 최종 서명부 미리보기가 표시됩니다."}</p>
+              </div>
+              <button className="primary-action" disabled={!preview?.rows.length || isGenerating} onClick={handleDownload} type="button">
+                {isGenerating ? "생성 중" : "최종서명부 생성"}
+              </button>
+            </div>
+
+            <div className="soft-alert" role="note">
+              최종 이수 판정은 05_전자서명기록의 저장완료 기록을 기준으로 계산합니다.
+            </div>
+
+            {generatedFile?.fileUrl ? (
+              <div className="soft-alert success" role="status">
+                생성된 최종서명부 파일: <a href={generatedFile.fileUrl} rel="noreferrer" target="_blank">Google Sheet 열기</a>
+              </div>
+            ) : null}
+
+            {preview ? (
+              <>
+                <section className="status-summary-grid" aria-label="최종 서명부 요약">
+                  <div className="status-summary-card">
+                    <span>대상자 수</span>
+                    <strong>{preview.summary.targetCount}</strong>
+                  </div>
+                  <div className="status-summary-card">
+                    <span>이수완료</span>
+                    <strong>{preview.summary.completed}</strong>
+                  </div>
+                  <div className="status-summary-card">
+                    <span>미서명</span>
+                    <strong>{unsignedCount}</strong>
+                  </div>
+                  <div className="status-summary-card">
+                    <span>이수율</span>
+                    <strong>{completionRate}%</strong>
+                  </div>
+                </section>
+
+                {preview.rows.length ? (
+                  <>
+                    <div className="admin-attendance-table-wrap">
+                      <table className="admin-attendance-table final-sheet-table">
+                        <thead>
+                          <tr>
+                            <th>순번</th>
+                            <th>성명</th>
+                            <th>소속부서</th>
+                            <th>직책</th>
+                            <th>서명여부</th>
+                            <th>서명일시</th>
+                            <th>서명파일</th>
+                            <th>이수증</th>
+                            <th>이수상태</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {preview.rows.map((row) => (
+                            <tr key={`${row.trainingId}-${row.sequence}-${row.name}`}>
+                              <td>{row.sequence}</td>
+                              <td>{row.name || "-"}</td>
+                              <td>{row.department || "-"}</td>
+                              <td>{row.position || "-"}</td>
+                              <td>{row.signatureStatus}</td>
+                              <td>{row.signedAt || row.attendedAt || "-"}</td>
+                              <td>{row.signatureFileUrl ? "저장됨" : "-"}</td>
+                              <td>{row.certificateStatus ?? (row.certificateSubmitted ? "제출" : "미제출")}</td>
+                              <td>
+                                <span className={statusClassName(row.completionStatus)}>{row.completionStatus}</span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="admin-attendance-cards">
+                      {preview.rows.map((row) => (
+                        <article className="training-card status-card" key={`${row.trainingId}-${row.sequence}-${row.name}`}>
+                          <div className="status-card-head">
+                            <div>
+                              <strong>
+                                {row.sequence}. {row.name || "-"}
+                              </strong>
+                              <p>
+                                {row.department || "부서 미입력"} · {row.position || "직위 미입력"}
+                              </p>
+                            </div>
+                            <span className={statusClassName(row.completionStatus)}>{row.completionStatus}</span>
+                          </div>
+                          <div className="badge-row">
+                            <span>{row.signatureStatus === "완료" ? "서명 완료" : "미서명"}</span>
+                            <span>서명 {row.signatureStatus}</span>
+                            <span>이수증 {row.certificateStatus ?? (row.certificateSubmitted ? "제출" : "미제출")}</span>
+                          </div>
+                          {row.signedAt || row.attendedAt ? <p>서명일시: {row.signedAt || row.attendedAt}</p> : null}
+                          {row.signatureFileUrl ? <p>서명파일URL: {row.signatureFileUrl}</p> : null}
+                        </article>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <div className="soft-alert" role="status">
+                    최종 서명부에 포함할 대상자가 없습니다.
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="empty-training">
+                <div>
+                  <strong>미리보기 대기 중</strong>
+                  <p>교육을 선택하면 최종 서명부 미리보기가 표시됩니다.</p>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+      </main>
+    </AdminAuthGate>
+  );
+}
